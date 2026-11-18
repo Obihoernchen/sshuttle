@@ -151,6 +151,16 @@ def parse_list(lst):
     return re.split(r'[\s,]+', lst.strip()) if lst else []
 
 
+def parse_positive_int(s):
+    try:
+        n = int(s)
+    except ValueError:
+        raise Fatal("%r is not a number." % s)
+    if n < 1:
+        raise Fatal("%r is not a positive number." % s)
+    return n
+
+
 def parse_namespace(namespace):
     if not re.fullmatch(
             r'(@?[a-z_A-Z]\w*(?:\.@?[a-z_A-Z]\w*)*)', namespace):
@@ -380,7 +390,7 @@ parser.add_argument(
 parser.add_argument(
     "--latency-buffer-size",
     metavar="SIZE",
-    type=int,
+    type=parse_positive_int,
     default=32768,
     dest="latency_buffer_size",
     help="""

@@ -404,3 +404,18 @@ def test_invalid_listen_is_a_usage_error(capsys):
     assert ("argument -l/--listen: 'foo:bar' is not a valid IP:port format"
             in capsys.readouterr().err)
     main.assert_not_called()
+
+
+@pytest.mark.parametrize('value', ['0', '-1', 'abc'])
+def test_latency_buffer_size_must_be_positive(value):
+    with pytest.raises(Fatal):
+        sshuttle.options.parse_positive_int(value)
+    with pytest.raises(SystemExit):
+        sshuttle.options.parser.parse_args(
+            ['--latency-buffer-size', value, '-r', 'example.invalid', '0/0'])
+
+
+def test_latency_buffer_size_accepts_positive_numbers():
+    opt = sshuttle.options.parser.parse_args(
+        ['--latency-buffer-size', '4096', '-r', 'example.invalid', '0/0'])
+    assert opt.latency_buffer_size == 4096
