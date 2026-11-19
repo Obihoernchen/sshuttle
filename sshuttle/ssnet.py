@@ -82,11 +82,12 @@ def close_later(sock):
             debug1('error closing %r: %s' % (sock, e))
 
 
-# Latency control sends a window of data, then a PING, and waits for the PONG
-# before sending more, so bulk data cannot fill ssh's buffers. The window
-# doubles while the latest PING is at most LATENCY_TARGET slower than the
-# fastest seen. It halves when the last LATENCY_SAMPLES all were, or one was
-# far slower, and otherwise holds (one slow PING may be jitter).
+# Latency control keeps at most a window of data in flight, so bulk data
+# cannot fill ssh's buffers. A PING follows every quarter window and its PONG
+# acks everything sent before it. The window doubles while PINGs are at most
+# LATENCY_TARGET / 2 over the fastest seen, halves when the last
+# LATENCY_SAMPLES were over LATENCY_TARGET (or one far over), else holds.
+# One PING per round trip counts, and none sent before a full new window.
 LATENCY_BUFFER_SIZE = 32768
 LATENCY_BUFFER_MAX = 16 * 1024 * 1024
 LATENCY_TARGET = 0.03  # seconds of queueing a bulk transfer may add
@@ -491,8 +492,9 @@ class Proxy(Handler):
 
 class Mux(Handler):
 
-    def __init__(self, rfile, wfile):
+    def __init__(self, rfile, wfile, latency_control=True):
         Handler.__init__(self, [rfile, wfile])
+        self.latency_control = latency_control
         self.rfile = rfile
         self.wfile = wfile
         self.new_channel = self.got_dns_req = self.got_routes = None
@@ -508,8 +510,16 @@ class Mux(Handler):
         self.window = LATENCY_BUFFER_SIZE
         self.min_rtt = None
         self.recent = []
-        self.pings = {b('chicken'): time.monotonic()}
+        # fullness counts all bytes sent and is never reset.
+        # pings maps each PING in flight to (time sent, fullness then).
+        self.acked = 0    # fullness acked by the latest PONG
+        self.pinged = 0   # fullness at the last PING
+        self.decided = 0  # PINGs up to here saw an old window
+        self.seq = 0
+        self.sampled = 0  # fullness at the last counted PING
+        self.pings = {b('chicken'): (time.monotonic(), 0)}
         self.queue_full = False
+        self.packet_cap = MAX_PACKET_DATA
         self.send(0, CMD_PING, b('chicken'))
 
     def next_channel(self):
@@ -528,31 +538,55 @@ class Mux(Handler):
         return total
 
     def check_fullness(self):
-        if self.fullness > self.window:
-            if not self.too_full:
-                self.pings[b('rttest')] = time.monotonic()
-                self.send(0, CMD_PING, b('rttest'))
-            self.too_full = True
+        if not self.latency_control:
+            return  # no window, full-size packets
+        # Waiting data always has a PING behind it, so a PONG will come.
+        if self.fullness - self.pinged >= max(1, self.window // 4):
+            self.seq += 1
+            data = b('rt%d' % self.seq)
+            self.send(0, CMD_PING, data)
+            self.pinged = self.fullness  # after the PING's own bytes
+            self.pings[data] = (time.monotonic(), self.fullness)
+        self.update_too_full()
+        # Small windows (slow links) get small packets so PINGs don't wait.
+        self.packet_cap = max(1, min(MAX_PACKET_DATA, self.window // 4))
+
+    def update_too_full(self):
+        self.too_full = (self.latency_control and
+                         self.fullness - self.acked > self.window)
 
     def adapt_window(self, data):
-        sent = self.pings.pop(data, None)
-        if sent is None:
+        entry = self.pings.pop(data, None)
+        if entry is None:
             return
+        sent, at = entry
+        self.acked = max(self.acked, at)
         rtt = time.monotonic() - sent
         if self.min_rtt is None or rtt < self.min_rtt:
             self.min_rtt = rtt
-        debug2('PING %r rtt=%.1fms min=%.1fms window=%d'
-               % (data, rtt * 1000, self.min_rtt * 1000, self.window))
-        if data != b('rttest'):
+        # Hot path: format only when logging.
+        if helpers.verbose >= 2:
+            debug2('PING %r rtt=%.1fms min=%.1fms window=%d in flight=%d'
+                   % (data, rtt * 1000, self.min_rtt * 1000, self.window,
+                      self.fullness - self.acked))
+        if data == b('chicken'):
             return  # the initial PING only measures the idle round trip
+        if at <= self.decided:
+            return  # sent before the window last changed
+        if at < self.sampled + self.window:
+            return  # same round trip as the last sample
+        self.sampled = at
+        old = self.window
         self.recent = (self.recent + [rtt])[-LATENCY_SAMPLES:]
         queued = rtt - self.min_rtt
-        if queued <= LATENCY_TARGET:
+        if queued <= LATENCY_TARGET / 2:
             self.window = min(self.window * 2,
                               max(LATENCY_BUFFER_MAX, LATENCY_BUFFER_SIZE))
         elif (min(self.recent) - self.min_rtt > LATENCY_TARGET or
                 queued > 4 * LATENCY_TARGET):
             self.window = max(self.window // 2, LATENCY_BUFFER_SIZE)
+        if self.window != old:
+            self.decided = self.fullness + self.window
 
     def send(self, channel, cmd, data):
         assert isinstance(data, bytes)
@@ -577,9 +611,7 @@ class Mux(Handler):
         elif cmd == CMD_PONG:
             debug2('received PING response')
             self.adapt_window(data)
-            if data == b('rttest'):
-                self.too_full = False
-                self.fullness = 0
+            self.update_too_full()
         elif cmd == CMD_EXIT:
             self.ok = False
         elif cmd == CMD_TCP_CONNECT:
@@ -743,7 +775,7 @@ class MuxWrapper(SockWrapper):
         if self.too_full():
             return 0  # too much already enqueued
         # At least 1, so a bad --latency-buffer-size cannot cut data off.
-        buf = buf[:max(1, min(LATENCY_BUFFER_SIZE, MAX_PACKET_DATA))]
+        buf = buf[:max(1, min(LATENCY_BUFFER_SIZE, self.mux.packet_cap))]
         self.mux.send(self.channel, CMD_TCP_DATA, buf)
         return len(buf)
 

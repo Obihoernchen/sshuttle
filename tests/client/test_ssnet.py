@@ -1,4 +1,5 @@
 import queue
+import random
 import select
 import socket
 import struct
@@ -329,13 +330,20 @@ def clocked_mux(monkeypatch):
         f.close()
 
 
-def round_trip(mux, clock, rtt):
-    """Fill the window, send the PING and answer it after rtt seconds."""
-    mux.fullness = mux.window + 1
+def ping(mux, amount=None):
+    """Send data until a PING goes out behind it and return its payload."""
+    seq = mux.seq
+    mux.fullness += mux.window // 4 if amount is None else amount
     mux.check_fullness()
-    assert mux.too_full
+    assert mux.seq == seq + 1
+    return b'rt%d' % mux.seq
+
+
+def round_trip(mux, clock, rtt):
+    """Send a PING behind a full window and answer it after rtt seconds."""
+    data = ping(mux, mux.window)
     clock.now += rtt
-    mux.got_packet(0, ssnet.CMD_PONG, b'rttest')
+    mux.got_packet(0, ssnet.CMD_PONG, data)
 
 
 def warm_up(mux, clock):
@@ -355,7 +363,7 @@ def test_latency_window_grows_while_round_trips_stay_short(clocked_mux):
     assert mux.min_rtt == pytest.approx(0.05)
     assert mux.window == ssnet.LATENCY_BUFFER_SIZE  # idle PING: no change
 
-    round_trip(mux, clock, 0.05 + ssnet.LATENCY_TARGET / 2)
+    round_trip(mux, clock, 0.05 + ssnet.LATENCY_TARGET / 4)
     assert mux.window == 2 * ssnet.LATENCY_BUFFER_SIZE
     for _ in range(20):
         round_trip(mux, clock, 0.05)
@@ -385,7 +393,7 @@ def test_latency_window_rides_out_jitter(clocked_mux):
     for _ in range(10):  # two of every three round trips are too slow
         round_trip(mux, clock, 0.05 + 3 * ssnet.LATENCY_TARGET)
         round_trip(mux, clock, 0.05 + 3 * ssnet.LATENCY_TARGET)
-        round_trip(mux, clock, 0.05 + ssnet.LATENCY_TARGET / 2)
+        round_trip(mux, clock, 0.05 + ssnet.LATENCY_TARGET / 4)
     assert mux.window > window
 
 
@@ -398,45 +406,151 @@ def test_latency_window_halves_at_once_when_far_too_slow(clocked_mux):
     assert mux.window == 4 * ssnet.LATENCY_BUFFER_SIZE
 
 
-def test_latency_window_holds_back_data_until_it_is_full(clocked_mux):
+def test_latency_window_doubles_only_while_the_queue_stays_short(clocked_mux):
+    """Doubling the window about doubles the queue: leave room for that."""
+    mux, clock = clocked_mux
+    warm_up(mux, clock)
+    window = mux.window
+    round_trip(mux, clock, 0.05 + 0.75 * ssnet.LATENCY_TARGET)
+    assert mux.window == window
+    round_trip(mux, clock, 0.05 + 0.4 * ssnet.LATENCY_TARGET)
+    assert mux.window == 2 * window
+
+
+def test_latency_window_changes_once_per_round_trip(clocked_mux):
+    """Only PINGs sent behind a full new window measured it."""
+    mux, clock = clocked_mux
+    warm_up(mux, clock)
+    window = mux.window
+    mux.fullness += mux.window
+    early = [ping(mux) for _ in range(3)]
+    clock.now += 0.05
+    mux.got_packet(0, ssnet.CMD_PONG, early[0])
+    assert mux.window == 2 * window
+    early = early[1:] + [ping(mux) for _ in range(3)]  # under a new window
+    for data in early:
+        mux.got_packet(0, ssnet.CMD_PONG, data)
+    assert mux.window == 2 * window
+
+    mux.fullness += mux.window
+    late = [ping(mux) for _ in range(3)]
+    clock.now += 0.05 + 5 * ssnet.LATENCY_TARGET
+    for data in late:
+        mux.got_packet(0, ssnet.CMD_PONG, data)
+    assert mux.window == window  # halved once, not three times
+
+
+def test_latency_window_takes_one_sample_per_round_trip(clocked_mux):
+    """PINGs a quarter window apart share a round trip, and its jitter."""
+    mux, clock = clocked_mux
+    warm_up(mux, clock)
+    window = mux.window
+    mux.fullness += mux.window
+    pings = [ping(mux) for _ in range(ssnet.LATENCY_SAMPLES)]
+    clock.now += 0.05 + 2 * ssnet.LATENCY_TARGET
+    for data in pings:
+        mux.got_packet(0, ssnet.CMD_PONG, data)
+    assert sum(rtt > 0.1 for rtt in mux.recent) == 1
+    assert mux.window == window  # one slow round trip may be jitter
+
+
+def test_mux_packets_shrink_with_the_window(clocked_mux):
+    mux, clock = clocked_mux
+    wrapper = ssnet.MuxWrapper(mux, 1)
+    assert wrapper.uwrite(b'x' * 100000) == ssnet.MAX_PACKET_DATA
+    mux.acked = mux.fullness
+    mux.check_fullness()
+    assert wrapper.uwrite(b'x' * 100000) == mux.window // 4
+    mux.window = ssnet.LATENCY_BUFFER_MAX
+    mux.acked = mux.fullness
+    mux.check_fullness()
+    assert wrapper.uwrite(b'x' * 100000) == ssnet.MAX_PACKET_DATA
+
+
+def test_mux_without_latency_control_never_holds_back_data():
+    """--no-latency-control: no window, even after the initial PONG."""
+    ours, theirs = socket.socketpair()
+    mux = ssnet.Mux(ours.makefile('rb', buffering=0),
+                    ours.makefile('wb', buffering=0), latency_control=False)
+    try:
+        wrapper = ssnet.MuxWrapper(mux, 1)
+        for _ in range(4):  # several windows before the initial PONG
+            assert wrapper.uwrite(b'x' * 100000) == ssnet.MAX_PACKET_DATA
+            mux.check_fullness()
+        mux.got_packet(0, ssnet.CMD_PONG, b'chicken')
+        mux.check_fullness()
+        assert not mux.too_full
+        assert wrapper.uwrite(b'x' * 100000) == ssnet.MAX_PACKET_DATA
+        assert list(mux.pings) == [] and mux.seq == 0  # no PINGs sent
+    finally:
+        for s in (mux.rfile, mux.wfile, ours, theirs):
+            s.close()
+
+
+def test_latency_window_keeps_sending_while_pings_are_in_flight(clocked_mux):
     mux, clock = clocked_mux
     mux.window = 4 * ssnet.LATENCY_BUFFER_SIZE
-    mux.fullness = mux.window
-    mux.check_fullness()
-    assert not mux.too_full
-    mux.fullness += 1
+    quarter = mux.window // 4
+    pings = [ping(mux, quarter) for _ in range(3)]
+    assert not mux.too_full  # three quarters in flight, PINGs unanswered
+    pings.append(ping(mux, quarter))
+    assert mux.too_full  # a full window (plus the PINGs) in flight
+    mux.got_packet(0, ssnet.CMD_PONG, pings[0])
+    assert not mux.too_full  # the first quarter arrived
+    assert mux.acked >= quarter
+    mux.fullness = mux.acked + mux.window + 1
     mux.check_fullness()
     assert mux.too_full
+    for data in pings[1:]:
+        mux.got_packet(0, ssnet.CMD_PONG, data)
+    assert not mux.too_full
+    assert mux.fullness > 5 * quarter  # never reset
+
+
+def test_latency_window_sends_no_pings_while_idle(clocked_mux):
+    mux, clock = clocked_mux
+    mux.window = 1  # even a window too small to split in quarters
+    mux.check_fullness()  # behind the initial PING's bytes
+    queued = len(mux.outbuf)
+    for _ in range(10):
+        mux.check_fullness()
+    assert len(mux.outbuf) == queued
+    for data in list(mux.pings):
+        mux.got_packet(0, ssnet.CMD_PONG, data)
+    mux.check_fullness()
+    assert len(mux.outbuf) == queued  # answers need no new PING
+    assert not mux.too_full
 
 
 def test_latency_window_ignores_unexpected_pongs(clocked_mux):
     mux, clock = clocked_mux
+    mux.fullness = mux.window + 1
+    mux.check_fullness()
+    assert mux.too_full
     clock.now += 0.05
     mux.got_packet(0, ssnet.CMD_PONG, b'rttest')  # no such PING in flight
+    mux.got_packet(0, ssnet.CMD_PONG, b'rt99')
     mux.got_packet(0, ssnet.CMD_PONG, b'chicken')
     mux.got_packet(0, ssnet.CMD_PONG, b'chicken')  # answered twice
     assert mux.window == ssnet.LATENCY_BUFFER_SIZE
     assert mux.min_rtt == pytest.approx(0.05)
+    assert mux.too_full
+    assert mux.acked == 0
 
 
-def test_latency_window_sends_one_rttest_at_a_time(clocked_mux):
-    """The initial PING's PONG must not end the wait for an rttest one."""
+def test_initial_pong_does_not_end_the_wait(clocked_mux):
+    """The initial PING went out before the data, so it acks none of it."""
     mux, clock = clocked_mux
     mux.fullness = mux.window + 1
     mux.check_fullness()  # sent right behind the initial PING
-    queued = len(mux.outbuf)
     clock.now += 0.05
     mux.got_packet(0, ssnet.CMD_PONG, b'chicken')
     assert mux.too_full
-    assert mux.fullness > mux.window
-    mux.check_fullness()
-    assert len(mux.outbuf) == queued  # no second PING
     clock.now += 0.01
-    mux.got_packet(0, ssnet.CMD_PONG, b'rttest')
+    mux.got_packet(0, ssnet.CMD_PONG, b'rt1')
     assert mux.min_rtt == pytest.approx(0.05)
     assert mux.window == 2 * ssnet.LATENCY_BUFFER_SIZE
     assert not mux.too_full
-    assert mux.fullness == 0
 
 
 def test_mux_flush_writes_until_the_pipe_is_full():
@@ -561,3 +675,33 @@ def test_a_busy_channel_does_not_hold_up_the_others():
     finally:
         for s in [mux_end, pipe, tick, tick_peer] + peers:
             s.close()
+
+
+@pytest.mark.parametrize('seed', range(20))
+def test_latency_window_never_stalls_without_a_ping_in_flight(
+        clocked_mux, seed):
+    """Whenever data waits, a PING behind it is on its way."""
+    mux, clock = clocked_mux
+    rng = random.Random(seed)
+    for _ in range(2000):
+        action = rng.random()
+        if action < 0.5:
+            mux.fullness += rng.choice(
+                [0, 1, rng.randrange(mux.window), 2 * mux.window])
+        elif mux.pings:
+            data = rng.choice(list(mux.pings))
+            clock.now += rng.choice([0.01, 0.05, 0.05, 0.2, 1.0])
+            mux.got_packet(0, ssnet.CMD_PONG, data)
+        mux.check_fullness()
+        if mux.too_full:
+            assert any(at > mux.acked for _, at in mux.pings.values())
+        assert ssnet.LATENCY_BUFFER_SIZE <= mux.window
+        assert mux.window <= ssnet.LATENCY_BUFFER_MAX
+
+
+def test_pong_answers_ping_with_the_same_payload(clocked_mux):
+    mux, clock = clocked_mux
+    del mux.outbuf[:]
+    mux.got_packet(0, ssnet.CMD_PING, b'rt7')
+    assert mux.outbuf == [struct.pack('!ccHHH', b'S', b'S', 0,
+                                      ssnet.CMD_PONG, 3) + b'rt7']

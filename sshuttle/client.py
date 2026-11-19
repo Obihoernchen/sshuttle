@@ -709,7 +709,7 @@ def _main(tcp_listener, udp_listener, fw, ssh_cmd, remotename,
             raise Fatal("SSH connection lost: broken pipe (server may have terminated unexpectedly)")
         else:
             raise
-    mux = Mux(rfile, wfile)
+    mux = Mux(rfile, wfile, latency_control)
     handlers.append(mux)
 
     expected = b'SSHUTTLE0001'
@@ -875,8 +875,7 @@ def _main(tcp_listener, udp_listener, fw, ssh_cmd, remotename,
     while 1:
         check_ssh_alive()
         ssnet.runonce(handlers, mux)
-        if latency_control:
-            mux.check_fullness()
+        mux.check_fullness()
 
 
 def main(listenip_v6, listenip_v4,

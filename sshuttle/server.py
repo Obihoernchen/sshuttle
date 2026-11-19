@@ -337,9 +337,9 @@ def main(latency_control, latency_buffer_size, auto_hosts, to_nameserver,
                 time.sleep(1)  # give enough time to write logs to stderr
                 os._exit(23)
             shim = SocketRWShim(r, w, on_end=_deferred_exit)
-            mux = Mux(*shim.makefiles())
+            mux = Mux(*shim.makefiles(), latency_control)
         else:
-            mux = Mux(r, w)
+            mux = Mux(r, w, latency_control)
         handlers.append(mux)
 
         debug1('auto-nets:' + str(auto_nets))
@@ -472,8 +472,7 @@ def main(latency_control, latency_buffer_size, auto_hosts, to_nameserver,
                         'hostwatch exited unexpectedly: code 0x%04x' % rv)
 
             ssnet.runonce(handlers, mux)
-            if latency_control:
-                mux.check_fullness()
+            mux.check_fullness()
 
             if dnshandlers:
                 now = time.time()
